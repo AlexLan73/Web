@@ -2,7 +2,7 @@
 # session-enter — вход агента в песочницу. Запуск от root.
 #   session-enter           запустить оболочку
 #   session-enter --probe   смоук-тест песочницы без входа
-# Эталон — этот файл (листинги в PLAN.md §8 устарели).
+# Эталон — этот файл.
 set -euo pipefail
 SESSION_USER="${SESSION_USER:-sess}"
 SESSION_ROOT="${SESSION_ROOT:-/run/session}"

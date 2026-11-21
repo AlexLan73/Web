@@ -132,7 +132,7 @@ debian-ephemeral-session/
     └── journald-volatile.conf    журнал в RAM
 ```
 
-**Эталон — файлы в `pc1/` и `pc2/`.** Листинги в §8 — версия 1.0, оставлены для истории ревью и устарели (см. §14.2); копировать скрипты только из каталогов.
+**Эталон — файлы в `pc1/` и `pc2/`** (перечень — §8); копировать скрипты только из каталогов.
 
 ---
 
@@ -185,314 +185,22 @@ sudo session-down --poweroff
 
 ---
 
-## 8. Скрипты (листинги версии 1.0 — УСТАРЕЛИ)
+## 8. Скрипты
 
-> **Заменено файлами `pc2/*`** (§14.2). Ниже — история; в частности, здесь ещё есть
-> ошибки, исправленные в 1.1: `--keep-groups` (нет такой опции bwrap), `--bind … /work`
-> на ro-корне (EROFS), `**/.claude*` без `/**`, remount раздела, патч от индекса.
+Эталон — файлы в каталогах, листинги в документе не дублируются (расхождение листингов и файлов уже приводило к ошибкам, см. §14).
 
-### 8.1 `/usr/local/sbin/session-up`
+| Файл | Ставится как | Назначение |
+|---|---|---|
+| `pc2/session-up` | `/usr/local/sbin/session-up` | ro-bind проекта, zram, tmpfs, копия проекта и ИИ-слоя с ПК1 в RAM |
+| `pc2/session-enter` | `/usr/local/sbin/session-enter` | песочница bwrap от `sess`; `--probe` — смоук-тест |
+| `pc2/session-deliver` | `/usr/local/sbin/session-deliver` | чистый патч (без ИИ-файлов) на ПК2 и ПК1 от имени владельца |
+| `pc2/session-down` | `/usr/local/sbin/session-down` | спасти невыгруженный патч, снять сеанс |
+| `pc2/verify.sh` | `/usr/local/sbin/session-verify` | проверка следов |
+| `pc2/install.sh`, `pc2/uninstall.sh` | — | установка и откат |
+| `pc2/journald-volatile.conf` | `/etc/systemd/journald.conf.d/99-volatile.conf` | журнал в RAM |
+| `pc1/*` | — | шлюз ПК1 (NAT, DHCP/DNS) |
 
-```bash
-#!/bin/bash
-set -euo pipefail
-SESSION_USER="${SESSION_USER:-sess}"
-SESSION_ROOT="${SESSION_ROOT:-/run/session}"
-LOCK="${LOCK:-/run/session.lock}"
-TMPFS_GB="${TMPFS_GB:-20}"
-ZRAM_GB="${ZRAM_GB:-12}"
-PROJECT_SRC="${PROJECT_SRC:-/data/proj}"
-WARM_CACHE="${WARM_CACHE:-/var/cache/rocm-warm}"
-
-log() { printf '\033[1;34m[session-up]\033[0m %s\n' "$*"; }
-die() { printf '\033[1;31m[session-up]\033[0m %s\n' "$*" >&2; exit 1; }
-
-[ "$(id -u)" -eq 0 ] || die "нужен root"
-id "$SESSION_USER" >/dev/null 2>&1 || die "нет пользователя $SESSION_USER"
-[ -d "$PROJECT_SRC" ] || die "не найден проект: $PROJECT_SRC"
-command -v bwrap >/dev/null 2>&1 || die "нет bubblewrap"
-
-# --- защита от повторного/параллельного запуска ---
-exec 9>"$LOCK"
-flock -n 9 || die "сеанс уже идёт (lock $LOCK)"
-if mountpoint -q "$SESSION_ROOT"; then
-  die "tmpfs уже смонтирован — сначала session-down"
-fi
-if fuser -m "$SESSION_ROOT" >/dev/null 2>&1; then
-  die "в $SESSION_ROOT ещё есть процессы"
-fi
-
-# --- swap только в RAM ---
-log "swap → zram"
-swapoff -a || true
-modprobe zram
-swapoff /dev/zram0 2>/dev/null || true
-echo 1 > /sys/block/zram0/reset
-echo "${ZRAM_GB}G" > /sys/block/zram0/disksize
-mkswap /dev/zram0 >/dev/null
-swapon /dev/zram0
-
-# --- tmpfs ---
-log "tmpfs ${TMPFS_GB}G → $SESSION_ROOT"
-mkdir -p "$SESSION_ROOT"
-mount -t tmpfs -o "size=${TMPFS_GB}G,mode=0755,nosuid,nodev" tmpfs "$SESSION_ROOT"
-mkdir -p "$SESSION_ROOT"/{work,home}
-chmod 700 "$SESSION_ROOT/home"
-
-# --- рабочая копия ---
-log "копирую $PROJECT_SRC → $SESSION_ROOT/work/proj"
-cp -a "$PROJECT_SRC" "$SESSION_ROOT/work/"
-
-# --- тёплый кеш ROCm: привязка к версии ROCm и ядру ---
-ROCM_VER="$(dpkg-query -W -f='${Version}' rocm-core 2>/dev/null || echo none)"
-KEY="${ROCM_VER}_$(uname -r)"
-if [ -d "$WARM_CACHE/$KEY" ]; then
-  log "кеш ROCm: $KEY"
-  mkdir -p "$SESSION_ROOT/home/.cache" "$SESSION_ROOT/home/.config"
-  cp -a "$WARM_CACHE/$KEY/.cache/."  "$SESSION_ROOT/home/.cache/"  2>/dev/null || true
-  cp -a "$WARM_CACHE/$KEY/.config/." "$SESSION_ROOT/home/.config/" 2>/dev/null || true
-else
-  log "кеша для $KEY нет — первый прогон будет медленным"
-fi
-
-chown -R "$SESSION_USER:$SESSION_USER" "$SESSION_ROOT"
-
-# --- диск: ro, жёстко, с проверкой ---
-TARGET="$(findmnt -n -o TARGET -T "$PROJECT_SRC")"
-if [ "$TARGET" = "/" ]; then
-  die "проект на корневой ФС — вынеси на отдельный раздел, иначе ro невозможен"
-fi
-trap 'mount -o remount,rw "$TARGET" 2>/dev/null || true' ERR
-mount -o remount,ro "$TARGET" || die "не удалось перевести $TARGET в ro"
-findmnt -no OPTIONS -T "$PROJECT_SRC" | grep -qw ro \
-  || die "$TARGET не в режиме ro — сеанс не начинаю"
-trap - ERR
-log "$TARGET → ro"
-
-log "готово: session-enter"
-```
-
-### 8.2 `/usr/local/sbin/session-enter`
-
-```bash
-#!/bin/bash
-set -euo pipefail
-SESSION_USER="${SESSION_USER:-sess}"
-SESSION_ROOT="${SESSION_ROOT:-/run/session}"
-PROJECT_DIR="${PROJECT_DIR:-proj}"
-TMP_MB="${TMP_MB:-2048}"
-
-[ "$(id -u)" -eq 0 ] || { echo "нужен root" >&2; exit 1; }
-mountpoint -q "$SESSION_ROOT" || { echo "сначала session-up" >&2; exit 1; }
-
-U="$(id -u "$SESSION_USER")"
-G="$(id -g "$SESSION_USER")"
-
-GPU=()
-[ -e /dev/kfd ] && GPU+=(--dev-bind-try /dev/kfd /dev/kfd)
-[ -e /dev/dri ] && GPU+=(--dev-bind-try /dev/dri /dev/dri)
-
-BW=(
-  --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try --keep-groups
-  --die-with-parent --hostname box
-  --ro-bind / /
-  --proc /proc
-  --dev /dev
-  "${GPU[@]}"
-  --ro-bind-try /run/systemd/resolve /run/systemd/resolve
-  --bind "$SESSION_ROOT/work" /work
-  --bind "$SESSION_ROOT/home" /home/sess
-  --size $((TMP_MB*1024*1024)) --tmpfs /tmp
-  --size $((TMP_MB*1024*1024)) --tmpfs /var/tmp
-  --size $((TMP_MB*1024*1024)) --tmpfs /dev/shm
-  --clearenv
-  --setenv HOME /home/sess
-  --setenv USER "$SESSION_USER"
-  --setenv LOGNAME "$SESSION_USER"
-  --setenv PATH /home/sess/.local/bin:/opt/rocm/bin:/usr/local/bin:/usr/bin:/bin
-  --setenv TERM "${TERM:-xterm-256color}"
-  --setenv ROCM_PATH /opt/rocm
-  --setenv HIP_PATH /opt/rocm
-  --setenv MIOPEN_USER_DB_PATH /home/sess/.config/miopen
-  --setenv MIOPEN_CUSTOM_CACHE_DIR /home/sess/.cache/miopen
-  --setenv HIP_VISIBLE_DEVICES 0
-  --setenv PYTHONUSERBASE /home/sess/.local
-  --setenv CCACHE_DIR /home/sess/.ccache
-  --setenv TRITON_CACHE_DIR /home/sess/.triton
-  --setenv PIP_NO_CACHE_DIR 1
-  --setenv PIP_DISABLE_PIP_VERSION_CHECK 1
-  --setenv PYTHONDONTWRITEBYTECODE 1
-  --chdir "/work/$PROJECT_DIR"
-)
-
-if [ "${1:-}" = "--probe" ]; then
-  exec setpriv --reuid="$U" --regid="$G" --init-groups -- \
-    bwrap "${BW[@]}" /bin/bash -c '
-      echo "id:        $(id)"
-      echo "gid kfd:   $(test -r /dev/kfd && echo ok || echo DENIED)"
-      echo "rocm:      $(command -v rocminfo || echo НЕТ)"
-      echo "gfx:       $(rocminfo 2>/dev/null | grep -m1 gfx || echo n/a)"
-      echo "dns:       $(getent hosts github.com >/dev/null && echo ok || echo FAIL)"
-      echo "write home:$(touch /home/sess/.probe && echo ok || echo FAIL)"
-      echo "git:       $(git -C /work/proj status --porcelain | wc -l) изменений"
-      echo "data ro:   $(findmnt -no OPTIONS -T /data | grep -qw ro && echo ro || echo RW!)"
-    '
-fi
-
-# PATH из --setenv перетрёт /etc/profile, поэтому ROCm добавлен через profile.d (install.sh)
-exec setpriv --reuid="$U" --regid="$G" --init-groups -- bwrap "${BW[@]}" /bin/bash -l
-```
-
-### 8.3 `/usr/local/sbin/session-deliver`
-
-```bash
-#!/bin/bash
-set -euo pipefail
-SESSION_ROOT="${SESSION_ROOT:-/run/session}"
-SRC_PROJ="${SRC_PROJ:-/data/proj}"
-W="$SESSION_ROOT/work/proj"
-PATCH="$SESSION_ROOT/out.patch"
-SAFE=(-c "safe.directory=$SRC_PROJ" -c "safe.directory=$W")
-
-[ "$(id -u)" -eq 0 ] || { echo "нужен root" >&2; exit 1; }
-[ -d "$W/.git" ] || { echo "нет рабочей копии или это не git-репозиторий" >&2; exit 1; }
-
-# Всё, что не относится к исходникам проекта, на диск не едет.
-EX=(
-  ':(exclude,glob)**/.claude*'  ':(exclude,glob)**/.codex*'
-  ':(exclude,glob)**/.cursor*'  ':(exclude,glob)**/.aider*'
-  ':(exclude,glob)**/.mcp.json' ':(exclude,glob)**/AGENTS.md'
-  ':(exclude,glob)**/CLAUDE.md' ':(exclude,glob)**/*.log'
-)
-
-BASE="$(git "${SAFE[@]}" -C "$W" rev-parse HEAD)"
-git "${SAFE[@]}" -C "$W" add -A -N -- . "${EX[@]}"
-git "${SAFE[@]}" -C "$W" diff --binary -- . "${EX[@]}" > "$PATCH"
-
-if [ ! -s "$PATCH" ]; then
-  echo "изменений исходников нет — на диск ничего не пишем"
-  exit 0
-fi
-echo "к применению:"; git "${SAFE[@]}" -C "$W" diff --stat -- . "${EX[@]}" | tail -20
-
-TARGET_BASE="$(git "${SAFE[@]}" -C "$SRC_PROJ" rev-parse HEAD 2>/dev/null || echo none)"
-if [ "$TARGET_BASE" != "$BASE" ]; then
-  echo "ОШИБКА: база разошлась." >&2
-  echo "  рабочая копия: $BASE" >&2
-  echo "  диск:          $TARGET_BASE" >&2
-  echo "  Патч сохранён: $PATCH — разбери вручную." >&2
-  exit 1
-fi
-
-TARGET="$(findmnt -n -o TARGET -T "$SRC_PROJ")"
-if [ "$TARGET" != "/" ]; then
-  mount -o remount,rw "$TARGET" || { echo "не удалось rw $TARGET" >&2; exit 1; }
-  trap 'mount -o remount,ro "$TARGET" 2>/dev/null || true' EXIT
-fi
-
-if ! git "${SAFE[@]}" -C "$SRC_PROJ" apply --index "$PATCH"; then
-  git "${SAFE[@]}" -C "$SRC_PROJ" apply --3way "$PATCH" || {
-    echo "ОШИБКА: патч не применился, сохранён в $PATCH" >&2; exit 1; }
-fi
-
-echo "применено:"; git "${SAFE[@]}" -C "$SRC_PROJ" diff --cached --stat | tail -20
-echo
-echo "Коммит не сделан намеренно: автор коммита — это след."
-echo "Закоммить своим именем: git -C $SRC_PROJ commit -m '...'"
-```
-
-### 8.4 `/usr/local/sbin/session-down`
-
-```bash
-#!/bin/bash
-set -euo pipefail
-SESSION_ROOT="${SESSION_ROOT:-/run/session}"
-SRC_PROJ="${SRC_PROJ:-/data/proj}"
-PATCH="$SESSION_ROOT/out.patch"
-[ "$(id -u)" -eq 0 ] || { echo "нужен root" >&2; exit 1; }
-
-# 1. Спасти невыгруженный патч: единственная копия сейчас в tmpfs.
-if [ -f "$PATCH" ]; then
-  SAFE=(-c "safe.directory=$SRC_PROJ")
-  if ! git "${SAFE[@]}" -C "$SRC_PROJ" apply --reverse --check "$PATCH" 2>/dev/null; then
-    KEEP="/var/tmp/session-$(date +%Y%m%d-%H%M%S).patch"
-    cp -a "$PATCH" "$KEEP" && sync
-    echo "ВНИМАНИЕ: правки, похоже, НЕ на диске. Копия сохранена: $KEEP"
-    read -r -p "Снять сеанс всё равно? [y/N] " a
-    [ "$a" = "y" ] || exit 1
-  fi
-fi
-
-# 2. Размонтировать сеанс
-if mountpoint -q "$SESSION_ROOT"; then
-  if fuser -m "$SESSION_ROOT" >/dev/null 2>&1; then
-    echo "в сеансе ещё есть процессы:" >&2; fuser -vm "$SESSION_ROOT" >&2 || true
-    exit 1
-  fi
-  umount "$SESSION_ROOT" || { echo "umount не удался — правки ещё в RAM!" >&2; exit 1; }
-fi
-rmdir "$SESSION_ROOT" 2>/dev/null || true
-
-# 3. Вернуть swap и диск в штатное состояние
-swapoff /dev/zram0 2>/dev/null || true
-TARGET="$(findmnt -n -o TARGET -T "$SRC_PROJ" 2>/dev/null || echo '')"
-if [ -n "$TARGET" ] && [ "$TARGET" != "/" ]; then
-  mount -o remount,rw "$TARGET" 2>/dev/null || true
-fi
-
-echo "сеанс снят: tmpfs и zram освобождены, $SRC_PROJ снова rw"
-[ "${1:-}" = "--poweroff" ] && systemctl poweroff
-exit 0
-```
-
-### 8.5 `journald-volatile.conf`
-
-```ini
-[Journal]
-Storage=volatile
-SystemMaxUse=200M
-RuntimeMaxUse=200M
-ForwardToSyslog=no
-```
-
-### 8.6 `/etc/profile.d/00-rocm-session.sh` (ставит install.sh)
-
-```sh
-# ROCm в PATH: /etc/profile в Debian перезаписывает PATH, поэтому только так
-case ":$PATH:" in *":/opt/rocm/bin:"*) ;; *) PATH="/opt/rocm/bin:$PATH";; esac
-export PATH
-export ROCM_PATH=/opt/rocm
-export HIP_PATH=/opt/rocm
-```
-
-### 8.7 `verify.sh` — ключевые блоки
-
-```bash
-STAMP="${STAMP:-/var/lib/session-stamp}"
-PROJ="${PROJ:-/data/proj}"
-SU="${SESSION_USER:-sess}"
-
-# 1. корень — с whitelist системного шума
-find / -xdev -newer "$STAMP" \
-  -not -path '/proc/*' -not -path '/sys/*' -not -path '/run/*' \
-  -not -path '/var/lib/sudo/*' -not -path '/var/lib/systemd/*' \
-  -not -path '/var/log/wtmp' -not -path '/var/log/lastlog' \
-  -not -path '/var/log/btmp' -not -path '/var/cache/*' \
-  -not -path '/var/lib/apt/*' 2>/dev/null | head -60
-
-# 2. /data отдельно: -xdev её не покрывает
-find "$PROJ" -newer "$STAMP" -path '*/.git' -prune -o \
-  -newer "$STAMP" -print 2>/dev/null | head -40
-
-# 3. конфиги агентов — без ограничения глубины
-find "$PROJ" \( -name '.git' -o -name 'node_modules' \) -prune -o \
-  \( -name '.claude*' -o -name '.codex*' -o -name '.cursor*' -o -name '.aider*' \
-     -o -name 'AGENTS.md' -o -name 'CLAUDE.md' -o -name '.mcp.json' \
-     -o -name '*.log' \) -print 2>/dev/null
-
-# 4. домашний каталог: любой непустой = провал A3
-[ -d "/home/$SU" ] && find "/home/$SU" -mindepth 1 | head
-```
+Все пути (`PROJECT_SRC`, `PC1_MOUNT`, `AI_HOME_SRC`, `PC1_PROJ`, `TMPFS_GB` и др.) — переменные окружения с умолчаниями в начале каждого скрипта.
 
 ---
 
@@ -527,7 +235,7 @@ sudo session-verify --mark    # до сеанса, в обычной загру�
 sudo session-verify           # после
 ```
 
-Скрипт печатает `date -Is` (метка mtime бессмысленна при сбитых часах — нужен `systemd-time-wait-sync`), проверяет 7 блоков из §8.7 и авторство в git.
+Скрипт печатает `date -Is` (метка mtime бессмысленна при сбитых часах — нужен `systemd-time-wait-sync`), проверяет все блоки `pc2/verify.sh`, включая авторство в git.
 
 ---
 
@@ -596,7 +304,7 @@ sudo session-verify           # после
 
 | # | Находка | Что изменено |
 |---|---|---|
-| B1 | `bash -l` перетирает `PATH` из `--setenv` (`/etc/profile`), ROCm не виден | добавлен `/etc/profile.d/00-rocm-session.sh` (§8.6), PATH пересобран |
+| B1 | `bash -l` перетирает `PATH` из `--setenv` (`/etc/profile`), ROCm не виден | добавлен `/etc/profile.d/00-rocm-session.sh` (ставит `pc2/install.sh`), PATH пересобран |
 | B2 | `install.sh` падал: нет каталога `/etc/systemd/journald.conf.d` | `install -d`, плюс `rm -rf /var/log/journal` |
 | B3 | повторный `session-up` падал на `disksize` (EBUSY) | `echo 1 > /sys/block/zram0/reset` |
 | B4 | `rm -rf` рабочей копии мог уничтожить живой сеанс | `flock` + проверки `mountpoint`/`fuser` |

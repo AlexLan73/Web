@@ -2,7 +2,7 @@
 # session-deliver — вернуть правки из tmpfs на диск ПК2 и на ПК1. Запуск от root, ИЗВНЕ песочницы.
 #   session-deliver               собрать патч и применить
 #   session-deliver --patch-only  только собрать $PATCH (для session-down)
-# Эталон — этот файл (листинги в PLAN.md §8 устарели).
+# Эталон — этот файл.
 set -euo pipefail
 umask 022
 SESSION_USER="${SESSION_USER:-sess}"

@@ -1,6 +1,6 @@
 #!/bin/bash
 # session-up — подготовка эфемерного сеанса на ПК2. Запуск от root.
-# Эталон — этот файл (листинги в PLAN.md §8 устарели).
+# Эталон — этот файл.
 set -euo pipefail
 umask 022
 SESSION_USER="${SESSION_USER:-sess}"

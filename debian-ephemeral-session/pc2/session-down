@@ -2,7 +2,7 @@
 # session-down — снять сеанс, спасти невыгруженные правки, вернуть проект в rw.
 #   session-down             размонтировать
 #   session-down --poweroff  размонтировать и выключить (RAM обнуляется)
-# Эталон — этот файл (листинги в PLAN.md §8 устарели).
+# Эталон — этот файл.
 set -euo pipefail
 SESSION_ROOT="${SESSION_ROOT:-/run/session}"
 SRC_STATE="${SRC_STATE:-/run/session.src}"
