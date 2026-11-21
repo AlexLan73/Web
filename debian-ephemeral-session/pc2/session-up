@@ -1,0 +1,140 @@
+#!/bin/bash
+# session-up — подготовка эфемерного сеанса на ПК2. Запуск от root.
+# Эталон — этот файл (листинги в PLAN.md §8 устарели).
+set -euo pipefail
+umask 022
+SESSION_USER="${SESSION_USER:-sess}"
+SESSION_ROOT="${SESSION_ROOT:-/run/session}"
+LOCK="${LOCK:-/run/session.lock}"
+SRC_STATE="${SRC_STATE:-/run/session.src}"   # путь проекта + число маунтов до ro-bind
+TMPFS_GB="${TMPFS_GB:-}"                     # пусто = размер проекта + ИИ-слой + запас
+TMPFS_RESERVE_GB="${TMPFS_RESERVE_GB:-6}"    # под сборку, кеши, .git-объекты
+RAM_KEEP_GB="${RAM_KEEP_GB:-20}"             # ОС, page cache, /tmp песочницы, zram
+ZRAM_GB="${ZRAM_GB:-12}"
+PROJECT_SRC="${PROJECT_SRC:-/data/proj}"
+WARM_CACHE="${WARM_CACHE:-/var/cache/rocm-warm}"
+PC1_MOUNT="${PC1_MOUNT:-/mnt/PC1}"
+AI_HOME_SRC="${AI_HOME_SRC:-$PC1_MOUNT/home/alex}"
+read -r -a AI_DIRS <<<"${AI_DIRS:-.claude .claude.json .cursor .config/opencode .aider .codex .continue}"
+
+log() { printf '\033[1;34m[session-up]\033[0m %s\n' "$*"; }
+die() { printf '\033[1;31m[session-up]\033[0m %s\n' "$*" >&2; exit 1; }
+mcount() { { findmnt -rn -M "$1" -o TARGET 2>/dev/null || true; } | wc -l; }
+
+[ "$(id -u)" -eq 0 ] || die "нужен root"
+id "$SESSION_USER" >/dev/null 2>&1 || die "нет пользователя $SESSION_USER"
+PROJECT_SRC="$(realpath -e "$PROJECT_SRC" 2>/dev/null)" || die "не найден проект: $PROJECT_SRC"
+[ -d "$PROJECT_SRC/.git" ] || die "$PROJECT_SRC — не git-репозиторий (нужен для deliver)"
+command -v bwrap >/dev/null 2>&1 || die "нет bubblewrap"
+
+# --- защита от повторного/параллельного запуска ---
+exec 9>"$LOCK"
+flock -n 9 || die "сеанс уже идёт (lock $LOCK)"
+mountpoint -q "$SESSION_ROOT" && die "tmpfs уже смонтирован — сначала session-down"
+[ -e "$SRC_STATE" ] && die "есть $SRC_STATE — прошлый сеанс не снят, сначала session-down"
+
+# --- размер: проект + ИИ-слой должны влезть в tmpfs, tmpfs — в RAM ---
+AI_PATHS=()
+if [ -d "$AI_HOME_SRC" ]; then
+  for d in "${AI_DIRS[@]}"; do [ -e "$AI_HOME_SRC/$d" ] && AI_PATHS+=("$AI_HOME_SRC/$d"); done
+fi
+BYTES="$(du -scB1 "$PROJECT_SRC" "${AI_PATHS[@]}" | tail -1 | cut -f1)"
+NEED_GB=$(( (BYTES + (1 << 30) - 1) >> 30 ))
+[ -n "$TMPFS_GB" ] || TMPFS_GB=$(( NEED_GB + TMPFS_RESERVE_GB ))
+MEM_GB=$(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) >> 20 ))
+log "данные ${NEED_GB}G, tmpfs ${TMPFS_GB}G, RAM ${MEM_GB}G"
+[ "$TMPFS_GB" -ge $(( NEED_GB + TMPFS_RESERVE_GB )) ] \
+  || die "TMPFS_GB=$TMPFS_GB мало: нужно ≥ $(( NEED_GB + TMPFS_RESERVE_GB ))"
+[ $(( MEM_GB - TMPFS_GB )) -ge "$RAM_KEEP_GB" ] \
+  || die "tmpfs ${TMPFS_GB}G не оставляет ${RAM_KEEP_GB}G RAM — уменьши проект или RAM_KEEP_GB"
+
+# --- откат при любой ошибке ниже ---
+OK=0
+cleanup() {
+  [ "$OK" -eq 1 ] && return
+  printf '\033[1;31m[session-up]\033[0m ошибка — откатываю\n' >&2
+  mountpoint -q "$SESSION_ROOT" && { umount "$SESSION_ROOT" 2>/dev/null || true; }
+  if [ -f "$SRC_STATE" ]; then
+    while [ "$(mcount "$PROJECT_SRC")" -gt "$N0" ]; do umount -l "$PROJECT_SRC" || break; done
+    rm -f "$SRC_STATE"
+  fi
+}
+trap cleanup EXIT
+
+# --- проект на диске: ro через bind-маунт самого каталога (не всего раздела) ---
+# До копирования: чтение через ro-маунт не обновляет atime на диске.
+N0="$(mcount "$PROJECT_SRC")"
+printf '%s\n%s\n' "$PROJECT_SRC" "$N0" > "$SRC_STATE"
+mount --bind "$PROJECT_SRC" "$PROJECT_SRC"
+mount -o remount,bind,ro "$PROJECT_SRC"
+findmnt -no OPTIONS -T "$PROJECT_SRC" | grep -qw ro || die "$PROJECT_SRC не в режиме ro — сеанс не начинаю"
+log "$PROJECT_SRC → ro (bind)"
+
+# --- swap только в RAM ---
+log "swap → zram"
+swapoff -a
+modprobe zram
+swapoff /dev/zram0 2>/dev/null || true
+echo 1 > /sys/block/zram0/reset
+echo "${ZRAM_GB}G" > /sys/block/zram0/disksize
+mkswap /dev/zram0 >/dev/null
+swapon /dev/zram0
+if swapon --noheadings --show=NAME | grep -qv '^/dev/zram'; then
+  die "остался дисковый swap — tmpfs может уйти на диск"
+fi
+
+# --- tmpfs ---
+log "tmpfs ${TMPFS_GB}G → $SESSION_ROOT"
+mkdir -p "$SESSION_ROOT"
+mount -t tmpfs -o "size=${TMPFS_GB}G,mode=0755,nosuid,nodev" tmpfs "$SESSION_ROOT"
+mkdir -p "$SESSION_ROOT"/{work,home,state/obj}
+chmod 700 "$SESSION_ROOT/home"
+
+# --- рабочая копия: всегда work/proj, независимо от имени каталога ---
+W="$SESSION_ROOT/work/proj"
+log "копирую $PROJECT_SRC → $W"
+cp -a "$PROJECT_SRC" "$W"
+
+# --- база для deliver: снимок исходного состояния (HEAD + индекс + рабочее дерево) ---
+# Новые объекты снимка — в state/obj (вне песочницы), остальные берутся из .git/objects
+# проекта на диске (ro весь сеанс): коммит/gc агента в рабочей копии базу не ломают.
+G=(git -c "safe.directory=$W" -c core.checkStat=minimal -c core.trustctime=false -C "$W")
+S="$SESSION_ROOT/state"
+"${G[@]}" rev-parse -q --verify HEAD > "$S/base.head" || echo none > "$S/base.head"
+[ -f "$W/.git/index" ] && cp "$W/.git/index" "$S/base.idx"
+export GIT_INDEX_FILE="$S/base.idx" GIT_OBJECT_DIRECTORY="$S/obj" \
+       GIT_ALTERNATE_OBJECT_DIRECTORIES="$PROJECT_SRC/.git/objects"
+"${G[@]}" add -A
+"${G[@]}" write-tree > "$S/base.tree"
+unset GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+
+# --- тёплый кеш ROCm: привязка к версии ROCm и ядру ---
+ROCM_VER="$(dpkg-query -W -f='${Version}' rocm-core 2>/dev/null || echo none)"
+KEY="${ROCM_VER}_$(uname -r)"
+if [ -d "$WARM_CACHE/$KEY" ]; then
+  log "кеш ROCm: $KEY"
+  mkdir -p "$SESSION_ROOT/home/.cache" "$SESSION_ROOT/home/.config"
+  cp -a "$WARM_CACHE/$KEY/.cache/."  "$SESSION_ROOT/home/.cache/"  2>/dev/null || true
+  cp -a "$WARM_CACHE/$KEY/.config/." "$SESSION_ROOT/home/.config/" 2>/dev/null || true
+else
+  log "кеша для $KEY нет — первый прогон будет медленным"
+fi
+
+# --- ИИ-слой с ПК1: промты/скилы/конфиги — ТОЛЬКО в RAM home ---
+# Источник на примонтированном диске ПК1. На диск ПК2 не пишется и в diff не едет.
+if [ "${#AI_PATHS[@]}" -gt 0 ]; then
+  log "ИИ-слой с ПК1 → RAM home ($AI_HOME_SRC)"
+  for d in "${AI_DIRS[@]}"; do
+    [ -e "$AI_HOME_SRC/$d" ] || continue
+    mkdir -p "$SESSION_ROOT/home/$(dirname "$d")"
+    cp -a "$AI_HOME_SRC/$d" "$SESSION_ROOT/home/$d"
+  done
+else
+  log "ИИ-слой не найден ($AI_HOME_SRC) — ПК1 не примонтирован?"
+fi
+
+# state/ остаётся root-овым: база deliver недоступна агенту
+chown -R "$SESSION_USER:$SESSION_USER" "$SESSION_ROOT/work" "$SESSION_ROOT/home"
+
+OK=1
+log "готово: session-enter"

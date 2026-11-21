@@ -1,0 +1,32 @@
+#!/usr/sbin/nft -f
+# gateway.nft — ПК1 раздаёт интернет на ПК2.
+# Интерфейсы подставляет install.sh; вручную: ip -br link
+#
+# Правила точечные: форвардинг для чужих сетей (docker, libvirt) не ломается,
+# потому что policy остаётся accept, а ограничение — только для LAN-интерфейса ПК2.
+
+# Идемпотентность: объявить-и-удалить, затем создать заново.
+table ip session_nat
+delete table ip session_nat
+table ip session_filter
+delete table ip session_filter
+
+define WAN     = "usb0"
+define LAN     = "enp3s0"
+define LANNET  = "10.10.0.0/24"
+
+table ip session_nat {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr $LANNET oifname $WAN masquerade
+  }
+}
+
+table ip session_filter {
+  chain forward {
+    type filter hook forward priority filter; policy accept;
+    iifname $LAN oifname $WAN accept                       # ПК2 → интернет
+    iifname $WAN oifname $LAN ct state established,related accept
+    iifname $LAN drop                                      # ПК2 не ходит куда-либо ещё
+  }
+}

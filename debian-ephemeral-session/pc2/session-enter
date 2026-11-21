@@ -1,0 +1,90 @@
+#!/bin/bash
+# session-enter — вход агента в песочницу. Запуск от root.
+#   session-enter           запустить оболочку
+#   session-enter --probe   смоук-тест песочницы без входа
+# Эталон — этот файл (листинги в PLAN.md §8 устарели).
+set -euo pipefail
+SESSION_USER="${SESSION_USER:-sess}"
+SESSION_ROOT="${SESSION_ROOT:-/run/session}"
+PROJECT_DIR="${PROJECT_DIR:-proj}"
+PC1_MOUNT="${PC1_MOUNT:-/mnt/PC1}"
+TMP_MB="${TMP_MB:-2048}"
+
+[ "$(id -u)" -eq 0 ] || { echo "нужен root" >&2; exit 1; }
+mountpoint -q "$SESSION_ROOT" || { echo "сначала session-up" >&2; exit 1; }
+
+U="$(id -u "$SESSION_USER")"
+G="$(id -g "$SESSION_USER")"
+
+# Корень песочницы — tmpfs bwrap; с хоста ro-биндятся только системные каталоги.
+# Скрыты: /home (настоящий проект и HOME владельца), /root, /mnt, /media,
+# точка монтирования ПК1 (ИИ-слой), /run (в т.ч. $SESSION_ROOT/state — база deliver).
+PC1_TOP="/$(printf '%s' "${PC1_MOUNT#/}" | cut -d/ -f1)"
+ROOT=()
+for p in /*; do
+  case "${p#/}" in home|root|mnt|media|tmp|proc|dev|run|lost+found) continue;; esac
+  [ "$p" = "$PC1_TOP" ] && continue
+  if [ -L "$p" ]; then ROOT+=(--symlink "$(readlink "$p")" "$p")
+  elif [ -d "$p" ]; then ROOT+=(--ro-bind "$p" "$p"); fi
+done
+ROOT+=(--tmpfs /run --ro-bind-try /run/systemd/resolve /run/systemd/resolve --ro-bind-try /run/udev /run/udev)
+RESOLV="$(readlink -f /etc/resolv.conf || true)"
+case "$RESOLV" in /run/*) ROOT+=(--ro-bind-try "$(dirname "$RESOLV")" "$(dirname "$RESOLV")");; esac
+
+# Доп. группы (render, video) даёт setpriv --init-groups; в userns bwrap они сохраняются.
+GPU=()
+[ -e /dev/kfd ] && GPU+=(--dev-bind-try /dev/kfd /dev/kfd)
+[ -e /dev/dri ] && GPU+=(--dev-bind-try /dev/dri /dev/dri)
+
+BW=(
+  --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup-try
+  --die-with-parent --hostname box
+  "${ROOT[@]}"
+  --proc /proc
+  --dev /dev
+  "${GPU[@]}"
+  --bind "$SESSION_ROOT/work" /work
+  --bind "$SESSION_ROOT/home" /home/sess
+  --size $((TMP_MB*1024*1024)) --tmpfs /tmp
+  --size $((TMP_MB*1024*1024)) --tmpfs /var/tmp
+  --size $((TMP_MB*1024*1024)) --tmpfs /dev/shm
+  --remount-ro /
+  --clearenv
+  --setenv HOME /home/sess
+  --setenv USER "$SESSION_USER"
+  --setenv LOGNAME "$SESSION_USER"
+  --setenv PATH /home/sess/.local/bin:/opt/rocm/bin:/usr/local/bin:/usr/bin:/bin
+  --setenv TERM "${TERM:-xterm-256color}"
+  --setenv ROCM_PATH /opt/rocm
+  --setenv HIP_PATH /opt/rocm
+  --setenv MIOPEN_USER_DB_PATH /home/sess/.config/miopen
+  --setenv MIOPEN_CUSTOM_CACHE_DIR /home/sess/.cache/miopen
+  --setenv HIP_VISIBLE_DEVICES 0
+  --setenv PYTHONUSERBASE /home/sess/.local
+  --setenv CCACHE_DIR /home/sess/.ccache
+  --setenv TRITON_CACHE_DIR /home/sess/.triton
+  --setenv PIP_NO_CACHE_DIR 1
+  --setenv PIP_DISABLE_PIP_VERSION_CHECK 1
+  --setenv PYTHONDONTWRITEBYTECODE 1
+  --chdir "/work/$PROJECT_DIR"
+)
+
+if [ "${1:-}" = "--probe" ]; then
+  exec setpriv --reuid="$U" --regid="$G" --init-groups -- \
+    bwrap "${BW[@]}" /bin/bash -c '
+      echo "id:        $(id)"
+      echo "kfd:       $(test -r /dev/kfd && echo ok || echo DENIED)"
+      echo "rocm:      $(command -v rocminfo || echo НЕТ)"
+      echo "gfx:       $(rocminfo 2>/dev/null | grep -m1 gfx || echo n/a)"
+      echo "dns:       $(getent hosts github.com >/dev/null && echo ok || echo FAIL)"
+      echo "write home:$(touch /home/sess/.probe && rm -f /home/sess/.probe && echo ok || echo FAIL)"
+      echo "write /:   $(touch /.probe 2>/dev/null && echo RW! || echo ro)"
+      echo "host home: $(ls /home | tr "\n" " ")(ожидается: sess)"
+      echo "ПК1:       $(test -e "$1" && echo ВИДЕН! || echo скрыт)"
+      echo "git:       $(git -C "/work/$2" status --porcelain 2>/dev/null | wc -l) изменений"
+    ' _ "$PC1_MOUNT" "$PROJECT_DIR"
+fi
+
+# PATH из --setenv перетирается /etc/profile, поэтому ROCm добавлен через
+# /etc/profile.d/00-rocm-session.sh (ставит install.sh).
+exec setpriv --reuid="$U" --regid="$G" --init-groups -- bwrap "${BW[@]}" /bin/bash -l

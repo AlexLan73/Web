@@ -1,0 +1,55 @@
+#!/bin/bash
+# session-down — снять сеанс, спасти невыгруженные правки, вернуть проект в rw.
+#   session-down             размонтировать
+#   session-down --poweroff  размонтировать и выключить (RAM обнуляется)
+# Эталон — этот файл (листинги в PLAN.md §8 устарели).
+set -euo pipefail
+SESSION_ROOT="${SESSION_ROOT:-/run/session}"
+SRC_STATE="${SRC_STATE:-/run/session.src}"
+SRC_PROJ="${SRC_PROJ:-$(head -1 "$SRC_STATE" 2>/dev/null || echo "${PROJECT_SRC:-/data/proj}")}"
+PATCH="$SESSION_ROOT/out.patch"
+HERE="$(dirname "$(readlink -f "$0")")"
+[ "$(id -u)" -eq 0 ] || { echo "нужен root" >&2; exit 1; }
+mcount() { { findmnt -rn -M "$1" -o TARGET 2>/dev/null || true; } | wc -l; }
+
+# 1. Спасти невыгруженные правки: патч собирается заново — по текущему состоянию,
+#    а не по последнему deliver (агент мог работать после него или deliver не было).
+if mountpoint -q "$SESSION_ROOT"; then
+  if ! "$HERE/session-deliver" --patch-only; then
+    echo "ВНИМАНИЕ: не удалось собрать патч — рабочая копия ещё в $SESSION_ROOT/work" >&2
+    read -r -p "Снять сеанс всё равно (правки пропадут)? [y/N] " a
+    [ "$a" = "y" ] || exit 1
+  elif [ -s "$PATCH" ] && ! git -c "safe.directory=$SRC_PROJ" -C "$SRC_PROJ" \
+         apply --reverse --check "$PATCH" 2>/dev/null; then
+    KEEP="/var/tmp/session-$(date +%Y%m%d-%H%M%S).patch"
+    cp "$PATCH" "$KEEP" && sync
+    echo "ВНИМАНИЕ: правки, похоже, НЕ на диске. Копия сохранена: $KEEP"
+    read -r -p "Снять сеанс всё равно? [y/N] " a
+    [ "$a" = "y" ] || exit 1
+  fi
+fi
+
+# 2. Размонтировать сеанс
+if mountpoint -q "$SESSION_ROOT"; then
+  if fuser -m "$SESSION_ROOT" >/dev/null 2>&1; then
+    echo "в сеансе ещё есть процессы:" >&2; fuser -vm "$SESSION_ROOT" >&2 || true
+    exit 1
+  fi
+  umount "$SESSION_ROOT" || { echo "umount не удался — правки ещё в RAM!" >&2; exit 1; }
+fi
+rmdir "$SESSION_ROOT" 2>/dev/null || true
+
+# 3. zram освободить; дисковый swap не включаем: в RAM могут остаться данные сеанса
+swapoff /dev/zram0 2>/dev/null || true
+[ -w /sys/block/zram0/reset ] && echo 1 > /sys/block/zram0/reset 2>/dev/null || true
+
+# 4. Снять ro-bind проекта (только свои маунты — сверх числа до session-up)
+if [ -f "$SRC_STATE" ]; then
+  P="$(head -1 "$SRC_STATE")"; N0="$(sed -n 2p "$SRC_STATE")"
+  while [ "$(mcount "$P")" -gt "$N0" ]; do umount -l "$P" || break; done
+  rm -f "$SRC_STATE"
+fi
+
+echo "сеанс снят: tmpfs и zram освобождены, $SRC_PROJ снова rw; дисковый swap — после перезагрузки"
+if [ "${1:-}" = "--poweroff" ]; then systemctl poweroff; fi
+exit 0

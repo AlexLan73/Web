@@ -1,0 +1,135 @@
+#!/bin/bash
+# session-deliver — вернуть правки из tmpfs на диск ПК2 и на ПК1. Запуск от root, ИЗВНЕ песочницы.
+#   session-deliver               собрать патч и применить
+#   session-deliver --patch-only  только собрать $PATCH (для session-down)
+# Эталон — этот файл (листинги в PLAN.md §8 устарели).
+set -euo pipefail
+umask 022
+SESSION_USER="${SESSION_USER:-sess}"
+SESSION_ROOT="${SESSION_ROOT:-/run/session}"
+SRC_STATE="${SRC_STATE:-/run/session.src}"
+SRC_PROJ="${SRC_PROJ:-$(head -1 "$SRC_STATE" 2>/dev/null || echo "${PROJECT_SRC:-/data/proj}")}"
+PC1_MOUNT="${PC1_MOUNT:-/mnt/PC1}"
+PC1_PROJ="${PC1_PROJ:-$PC1_MOUNT$SRC_PROJ}"
+W="$SESSION_ROOT/work/proj"
+S="$SESSION_ROOT/state"
+PATCH="$SESSION_ROOT/out.patch"
+
+[ "$(id -u)" -eq 0 ] || { echo "нужен root" >&2; exit 1; }
+[ -d "$W/.git" ] || { echo "нет рабочей копии или это не git-репозиторий" >&2; exit 1; }
+[ -s "$S/base.tree" ] || { echo "нет базы сеанса ($S/base.tree) — session-up старой версии?" >&2; exit 1; }
+BASE="$(cat "$S/base.head")"
+TREE="$(cat "$S/base.tree")"
+
+mcount() { { findmnt -rn -M "$1" -o TARGET 2>/dev/null || true; } | wc -l; }
+# git от имени владельца репозитория: иначе root-овые файлы/каталоги в .git и дереве
+# (на ПК1 через сеть root вообще может быть squash-нут).
+as_owner() {
+  local d="$1" u g h grp=--clear-groups; shift
+  u="$(stat -c %u "$d")"; g="$(stat -c %g "$d")"
+  h="$(getent passwd "$u" | cut -d: -f6 || true)"
+  [ -n "$h" ] && grp=--init-groups
+  setpriv --reuid="$u" --regid="$g" "$grp" -- env HOME="${h:-/nonexistent}" "$@"
+}
+
+# Всё, что не относится к исходникам проекта, на диск не едет.
+# Для каталогов нужен и вариант '/**': '**/.claude*' исключает только сам путь, не содержимое.
+EX=()
+for n in .claude .codex .cursor .aider .opencode .continue; do
+  EX+=(":(exclude,glob)**/$n*" ":(exclude,glob)**/$n*/**")
+done
+EX+=(':(exclude,glob)**/.mcp.json' ':(exclude,glob)**/AGENTS.md'
+     ':(exclude,glob)**/CLAUDE.md' ':(exclude,glob)**/*.log')
+
+# --- патч: база (session-up или прошлый deliver) → текущее дерево, включая коммиты/индекс агента ---
+# git по рабочей копии — в песочнице: конфиг .git/ правил агент (фильтры, fsmonitor),
+# выполнять его вне bwrap — значит дать агенту запись на диск. Новые объекты — в stage/,
+# .git рабочей копии не трогаем.
+# Объекты проекта на диске открывает root и передаёт fd: sess в /home/<владелец> (0700) не пустят.
+ST="$S/stage"
+rm -rf "$ST"; mkdir -p "$ST/obj"; chown -R "$SESSION_USER:" "$ST"
+exec 7< "$SRC_PROJ/.git/objects"
+setpriv --reuid="$(id -u "$SESSION_USER")" --regid="$(id -g "$SESSION_USER")" --init-groups -- \
+  bwrap --unshare-all --die-with-parent \
+    --ro-bind /usr /usr --ro-bind /etc /etc \
+    --symlink usr/bin /bin --symlink usr/sbin /sbin --symlink usr/lib /lib --symlink usr/lib64 /lib64 \
+    --proc /proc --dev /dev --tmpfs /tmp \
+    --ro-bind "$S" "$S" --bind "$ST" "$ST" --ro-bind-fd 7 /srcobj --ro-bind "$W" "$W" \
+    --clearenv --setenv PATH /usr/bin:/bin --setenv HOME /nonexistent \
+    /bin/bash -c '
+      set -euo pipefail
+      W="$1" TREE="$2" S="$3" ST="$4"; shift 4
+      cp "$S/base.idx" "$ST/idx" 2>/dev/null || true
+      export GIT_INDEX_FILE="$ST/idx" GIT_OBJECT_DIRECTORY="$ST/obj" \
+             GIT_ALTERNATE_OBJECT_DIRECTORIES="$S/obj:/srcobj"
+      g() { git -c core.checkStat=minimal -c core.trustctime=false -C "$W" "$@"; }
+      g cat-file -e "$TREE" || { echo "база сеанса потеряна" >&2; exit 1; }
+      g add -A -- . "$@"
+      g write-tree > "$ST/tree"
+      g diff --cached --binary "$TREE" -- . "$@"
+    ' _ "$W" "$TREE" "$S" "$ST" "${EX[@]}" > "$PATCH"
+exec 7<&-
+chmod 0644 "$PATCH"
+# после успешного применения на ПК2 база сдвигается: следующий deliver/down — только новое
+promote() {
+  cp -r --update=none "$ST/obj/." "$S/obj/"
+  cp "$ST/idx" "$S/base.idx"; cp "$ST/tree" "$S/base.tree"
+}
+
+[ "${1:-}" = "--patch-only" ] && exit 0
+
+if [ ! -s "$PATCH" ]; then
+  echo "изменений исходников нет — на диск ничего не пишем"
+  exit 0
+fi
+echo "к применению:"; git apply --stat "$PATCH" | tail -20
+
+TARGET_BASE="$(git -c "safe.directory=$SRC_PROJ" -C "$SRC_PROJ" rev-parse -q --verify HEAD 2>/dev/null || echo none)"
+if [ "$TARGET_BASE" != "$BASE" ]; then
+  echo "ОШИБКА: база разошлась." >&2
+  echo "  при session-up: $BASE" >&2
+  echo "  диск сейчас:    $TARGET_BASE" >&2
+  echo "  Патч сохранён: $PATCH — разбери вручную." >&2
+  exit 1
+fi
+
+# --- снять ro-bind сеанса на время записи, вернуть по выходу ---
+if [ -f "$SRC_STATE" ] && [ "$(head -1 "$SRC_STATE")" = "$SRC_PROJ" ]; then
+  N0="$(sed -n 2p "$SRC_STATE")"
+  while [ "$(mcount "$SRC_PROJ")" -gt "$N0" ]; do umount -l "$SRC_PROJ"; done
+  trap 'mount --bind "$SRC_PROJ" "$SRC_PROJ" && mount -o remount,bind,ro "$SRC_PROJ" \
+        || echo "ВНИМАНИЕ: $SRC_PROJ не вернулся в ro" >&2' EXIT
+fi
+
+# --index → без индекса (пути, не отслеживаемые git на диске) → --3way.
+# --3way берёт блобы из снимка базы и stage (объекты агента не используем).
+ALT="$S/obj:$ST/obj"
+apply_to() {
+  as_owner "$1" git -C "$1" apply --index "$PATCH" 2>/dev/null \
+  || as_owner "$1" git -C "$1" apply "$PATCH" 2>/dev/null \
+  || as_owner "$1" env GIT_ALTERNATE_OBJECT_DIRECTORIES="$ALT" git -C "$1" apply --3way "$PATCH"
+}
+apply_to "$SRC_PROJ" || { echo "ОШИБКА: патч не применился, сохранён в $PATCH" >&2; exit 1; }
+promote
+
+echo "применено:"; git -c "safe.directory=$SRC_PROJ" -C "$SRC_PROJ" diff --cached --stat | tail -20
+
+# --- тот же чистый патч на ПК1 (общий диск); пуш в GitHub — руками с ПК1 ---
+# Базу не сверяем: на ПК1 прошлые сеансы уже закоммичены, патч инкрементальный.
+if [ -d "$PC1_PROJ/.git" ]; then
+  if apply_to "$PC1_PROJ"; then
+    echo "ПК1 обновлён: $PC1_PROJ"
+  else
+    KEEP1="$(dirname "$PC1_PROJ")/session-$(date +%Y%m%d-%H%M%S).patch"
+    if as_owner "$PC1_PROJ" cp "$PATCH" "$KEEP1"; then
+      echo "патч не лёг на ПК1 — сохранён: $KEEP1" >&2
+    else
+      echo "патч не лёг на ПК1 и не сохранён туда; копия: $PATCH" >&2
+    fi
+  fi
+else
+  echo "нет git-репозитория ПК1 ($PC1_PROJ) — на ПК1 не доставлено"
+fi
+echo
+echo "Коммит не сделан намеренно: автор коммита — это след."
+echo "Закоммить своим именем на ПК1 (или: git -C $SRC_PROJ commit)."
